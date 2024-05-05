@@ -4,7 +4,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install databricks-genai-inference
+# MAGIC %pip install --upgrade databricks-vectorsearch databricks-genai-inference llama-index llama-index-readers-web
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -18,20 +18,66 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install --upgrade databricks-vectorsearch databricks-genai-inference llama-index llama-index-readers-web
-# MAGIC dbutils.library.restartPython() 
+if not table_exists("raw_documentation") or spark.table("raw_documentation").isEmpty():
+    # Download Netflix documentation to a DataFrame 
+    doc_articles = download_netflix_documentation_articles()
+    doc_articles.write.mode('overwrite').saveAsTable("raw_documentation")
+display(spark.table("raw_documentation").limit(5))
+
+# COMMAND ----------
+
+# %sql
+# -- DROP TABLE IF EXISTS databricks_generative_ai_world_cup.netflix.source_table;
+# -- DROP TABLE IF EXISTS databricks_generative_ai_world_cup.netflix.vs_index;
+
+# COMMAND ----------
+
+from langchain.text_splitter import HTMLHeaderTextSplitter, RecursiveCharacterTextSplitter
+from transformers import AutoTokenizer, OpenAIGPTTokenizer
+
+max_chunk_size = 500
+
+tokenizer = OpenAIGPTTokenizer.from_pretrained("openai-gpt")
+text_splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(tokenizer, chunk_size=max_chunk_size, chunk_overlap=50)
+html_splitter = HTMLHeaderTextSplitter(headers_to_split_on=[("h2", "header2")])
+
+# Split on H2, but merge small h2 chunks together to avoid too small. 
+def split_html_on_h2(html, min_chunk_size = 20, max_chunk_size=500):
+  if not html:
+      return []
+  h2_chunks = html_splitter.split_text(html)
+  chunks = []
+  previous_chunk = ""
+  # Merge chunks together to add text before h2 and avoid too small docs.
+  for c in h2_chunks:
+    # Concat the h2 (note: we could remove the previous chunk to avoid duplicate h2)
+    content = c.metadata.get('header2', "") + "\n" + c.page_content
+    if len(tokenizer.encode(previous_chunk + content)) <= max_chunk_size/2:
+        previous_chunk += content + "\n"
+    else:
+        chunks.extend(text_splitter.split_text(previous_chunk.strip()))
+        previous_chunk = content + "\n"
+  if previous_chunk:
+      chunks.extend(text_splitter.split_text(previous_chunk.strip()))
+  # Discard too small chunks
+  return [c for c in chunks if len(tokenizer.encode(c)) > min_chunk_size]
+ 
+# Let's try our chunking function
+html = spark.table("raw_documentation").limit(1).collect()[0]['text']
+split_html_on_h2(html)
 
 # COMMAND ----------
 
 from pyspark.sql.types import StructType, StructField, StringType, ArrayType, FloatType 
 
-# Create table and schema if necessary
-spark.sql("CREATE SCHEMA IF NOT EXISTS databricks_generative_ai_world_cup.netflix")
+# Create schema and table 
+spark.sql(f'CREATE SCHEMA IF NOT EXISTS {CATALOG}.{DB}')
 spark.sql(
-    """
-    CREATE TABLE IF NOT EXISTS databricks_generative_ai_world_cup.netflix.source_table (
+    f"""
+    CREATE TABLE IF NOT EXISTS {CATALOG}.{DB}.netflix_documentation (
         id STRING,
-        text STRING 
+        url STRING,
+        text STRING
     )
     USING delta 
     TBLPROPERTIES ("delta.enableChangeDataFeed" = "true")
@@ -40,18 +86,35 @@ spark.sql(
 
 # COMMAND ----------
 
+# Chunk all documents with spark
+@pandas_udf("array<string>")
+def parse_and_split(docs: pd.Series) -> pd.Series:
+    return docs.apply(split_html_on_h2)
+    
+(spark.table("raw_documentation")
+      .filter('text is not null')
+      .withColumn('content', F.explode(parse_and_split('text')))
+      .drop("text")
+      .write.mode('overwrite').saveAsTable("netflix_documentation"))
+
+display(spark.table("netflix_documentation"))
+
+# COMMAND ----------
+
 from databricks.vector_search.client import VectorSearchClient 
 vsc = VectorSearchClient()
 
 # COMMAND ----------
 
-VS_ENDPOINT = "netflix_rag"
-VS_INDEX = "databricks_generative_ai_world_cup.netflix.vs_index"
-VS_SOURCE_TABLE = "databricks_generative_ai_world_cup.netflix.source_table"
+# Create endpoint 
+if not endpoint_exists(vsc, VS_ENDPOINT):
+    vsc.create_endpoint(name=VS_ENDPOINT, endpoint_type="STANDARD")
+wait_for_vs_endpoint_to_be_ready(vsc, VS_ENDPOINT)
+print(f"Endpoint {VS_ENDPOINT} is ready.")
 
 # COMMAND ----------
 
-# Create index if necessary
+# Create index 
 if not index_exists(vsc, VS_ENDPOINT, VS_INDEX):
   print(f"Creating index {VS_INDEX} on endpoint {VS_ENDPOINT}...")
   vsc.create_delta_sync_index(
@@ -64,13 +127,14 @@ if not index_exists(vsc, VS_ENDPOINT, VS_INDEX):
     embedding_model_endpoint_name="databricks-bge-large-en"
   )
 wait_for_index_to_be_ready(vsc, VS_ENDPOINT, VS_INDEX)
+print(f"Index {VS_INDEX} is ready.")
 
 # COMMAND ----------
 
-# Remove all data from source table 
-spark.sql(
-    "TRUNCATE TABLE databricks_generative_ai_world_cup.netflix.source_table"
-)
+# # Remove data from source table 
+# spark.sql(
+#     "TRUNCATE TABLE databricks_generative_ai_world_cup.netflix.source_table"
+# )
 
 # COMMAND ----------
 
@@ -78,16 +142,16 @@ urls=[
   "https://help.netflix.com/en/node/412",
   "https://help.netflix.com/en/node/22",
   "https://help.netflix.com/en/node/407",
-#   "https://help.netflix.com/en/node/116380",
-#   "https://help.netflix.com/en/node/244",
-#   "https://help.netflix.com/en/node/123277",
-#   "https://help.netflix.com/en/node/13243",
-#   "https://help.netflix.com/en/node/41049",
-#   "https://help.netflix.com/en/node/32950",
-#   "https://help.netflix.com/en/node/113408",
-#   "https://help.netflix.com/en/node/54896",
-#   "https://help.netflix.com/en/node/59095",
-#   "https://help.netflix.com/en/node/29",
+  "https://help.netflix.com/en/node/116380",
+  "https://help.netflix.com/en/node/244",
+  "https://help.netflix.com/en/node/123277",
+  "https://help.netflix.com/en/node/13243",
+  "https://help.netflix.com/en/node/41049",
+  "https://help.netflix.com/en/node/32950",
+  "https://help.netflix.com/en/node/113408",
+  "https://help.netflix.com/en/node/54896",
+  "https://help.netflix.com/en/node/59095",
+  "https://help.netflix.com/en/node/29",
 #   "https://help.netflix.com/en/node/34",
 #   "https://help.netflix.com/en/node/2065",
 #   "https://help.netflix.com/en/node/1019",
@@ -169,6 +233,42 @@ urls=[
 
 # COMMAND ----------
 
+from langchain.text_splitter import HTMLHeaderTextSplitter, RecursiveCharacterTextSplitter
+from transformers import AutoTokenizer, OpenAIGPTTokenizer
+
+max_chunk_size = 500
+
+tokenizer = OpenAIGPTTokenizer.from_pretrained("openai-gpt")
+text_splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(tokenizer, chunk_size=max_chunk_size, chunk_overlap=50)
+html_splitter = HTMLHeaderTextSplitter(headers_to_split_on=[("h2", "header2")])
+
+# Split on H2, but merge small h2 chunks together to avoid too small. 
+def split_html_on_h2(html, min_chunk_size = 20, max_chunk_size=500):
+  if not html:
+      return []
+  h2_chunks = html_splitter.split_text(html)
+  chunks = []
+  previous_chunk = ""
+  # Merge chunks together to add text before h2 and avoid too small docs.
+  for c in h2_chunks:
+    # Concat the h2 (note: we could remove the previous chunk to avoid duplicate h2)
+    content = c.metadata.get('header2', "") + "\n" + c.page_content
+    if len(tokenizer.encode(previous_chunk + content)) <= max_chunk_size/2:
+        previous_chunk += content + "\n"
+    else:
+        chunks.extend(text_splitter.split_text(previous_chunk.strip()))
+        previous_chunk = content + "\n"
+  if previous_chunk:
+      chunks.extend(text_splitter.split_text(previous_chunk.strip()))
+  # Discard too small chunks
+  return [c for c in chunks if len(tokenizer.encode(c)) > min_chunk_size]
+ 
+# Let's try our chunking function
+html = spark.table("raw_documentation").limit(1).collect()[0]['text']
+split_html_on_h2(html)
+
+# COMMAND ----------
+
 from llama_index.readers.web import SimpleWebPageReader
 from llama_index.core.node_parser import SentenceSplitter
 
@@ -183,6 +283,7 @@ chunks = parser.get_nodes_from_documents(reader.load_data(urls))
 schema = StructType(
     [
         StructField("id", StringType(), True),
+        StructField("url", StringType(), True),
         StructField("text", StringType(), True),
     ]
 )
@@ -194,12 +295,19 @@ df = spark.createDataFrame([], schema)
 for chunk in chunks: 
     chunk = chunk.dict()
     chunk_id = chunk["id_"]
+    chunk_url = chunk["url"]
     chunk_text = chunk["text"]
 
-    new_row = spark.createDataFrame([(chunk_id, chunk_text)], schema)
+    # new_row = spark.createDataFrame([(chunk_id, chunk_text)], schema)
+    new_row = spark.createDataFrame([(chunk_id, chunk_url, chunk_text)], schema)
     df = df.union(new_row)
 
 df.write.format("delta").mode("append").saveAsTable("databricks_generative_ai_world_cup.netflix.source_table")
+display(spark.table("databricks_generative_ai_world_cup.netflix.source_table"))
+
+# COMMAND ----------
+
+reader.load_data(urls)
 
 # COMMAND ----------
 
