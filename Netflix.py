@@ -4,7 +4,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install databricks-genai-inference
+# MAGIC %pip install --upgrade databricks-vectorsearch databricks-genai-inference llama-index llama-index-readers-web
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
@@ -18,14 +18,17 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install --upgrade databricks-vectorsearch databricks-genai-inference llama-index llama-index-readers-web
-# MAGIC dbutils.library.restartPython() 
+# if not table_exists("raw_documentation") or spark.table("raw_documentation").isEmpty():
+#     # Download Netflix documentation to a DataFrame 
+#     doc_articles = download_netflix_documentation_articles()
+#     doc_articles.write.mode('overwrite').saveAsTable("raw_documentation")
+# display(spark.table("raw_documentation").limit(5))
 
 # COMMAND ----------
 
 from pyspark.sql.types import StructType, StructField, StringType, ArrayType, FloatType 
 
-# Create table and schema if necessary
+# Create schema and table
 spark.sql("CREATE SCHEMA IF NOT EXISTS databricks_generative_ai_world_cup.netflix")
 spark.sql(
     """
@@ -45,13 +48,15 @@ vsc = VectorSearchClient()
 
 # COMMAND ----------
 
-VS_ENDPOINT = "netflix_rag"
-VS_INDEX = "databricks_generative_ai_world_cup.netflix.vs_index"
-VS_SOURCE_TABLE = "databricks_generative_ai_world_cup.netflix.source_table"
+# Create endpoint 
+if not endpoint_exists(vsc, VS_ENDPOINT):
+  vsc.create_endpoint(name=VS_ENDPOINT, endpoint_type="STANDARD")
+wait_for_vs_endpoint_to_be_ready(vsc, VS_ENDPOINT)
+print(f"Endpoint {VS_ENDPOINT} is ready.")
 
 # COMMAND ----------
 
-# Create index if necessary
+# Create index 
 if not index_exists(vsc, VS_ENDPOINT, VS_INDEX):
   print(f"Creating index {VS_INDEX} on endpoint {VS_ENDPOINT}...")
   vsc.create_delta_sync_index(
@@ -64,12 +69,13 @@ if not index_exists(vsc, VS_ENDPOINT, VS_INDEX):
     embedding_model_endpoint_name="databricks-bge-large-en"
   )
 wait_for_index_to_be_ready(vsc, VS_ENDPOINT, VS_INDEX)
+print(f"Index {VS_INDEX} is ready.")
 
 # COMMAND ----------
 
 # Remove all data from source table 
 spark.sql(
-    "TRUNCATE TABLE databricks_generative_ai_world_cup.netflix.source_table"
+    f"TRUNCATE TABLE databricks_generative_ai_world_cup.netflix.source_table"
 )
 
 # COMMAND ----------
@@ -200,6 +206,7 @@ for chunk in chunks:
     df = df.union(new_row)
 
 df.write.format("delta").mode("append").saveAsTable("databricks_generative_ai_world_cup.netflix.source_table")
+display(spark.table("databricks_generative_ai_world_cup.netflix.source_table"))
 
 # COMMAND ----------
 

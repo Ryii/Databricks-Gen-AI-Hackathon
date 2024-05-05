@@ -1,4 +1,48 @@
 # Databricks notebook source
+# MAGIC %md
+# MAGIC Run `config` and create helper functions
+
+# COMMAND ----------
+
+# MAGIC %run ./config $reset_all_data=false
+
+# COMMAND ----------
+
+def endpoint_exists(vsc, vs_endpoint_name):
+  try:
+    return vs_endpoint_name in [e['name'] for e in vsc.list_endpoints().get('endpoints', [])]
+  except Exception as e:
+    #Temp fix for potential REQUEST_LIMIT_EXCEEDED issue
+    if "REQUEST_LIMIT_EXCEEDED" in str(e):
+      print("WARN: couldn't get endpoint status due to REQUEST_LIMIT_EXCEEDED error. The demo will consider it exists")
+      return True
+    else:
+      raise e
+
+def wait_for_vs_endpoint_to_be_ready(vsc, vs_endpoint_name):
+  for i in range(180):
+    try:
+      endpoint = vsc.get_endpoint(vs_endpoint_name)
+    except Exception as e:
+      #Temp fix for potential REQUEST_LIMIT_EXCEEDED issue
+      if "REQUEST_LIMIT_EXCEEDED" in str(e):
+        print("WARN: couldn't get endpoint status due to REQUEST_LIMIT_EXCEEDED error. Please manually check your endpoint status")
+        return
+      else:
+        raise e
+    status = endpoint.get("endpoint_status", endpoint.get("status"))["state"].upper()
+    if "ONLINE" in status:
+      return endpoint
+    elif "PROVISIONING" in status or i <6:
+      if i % 20 == 0: 
+        print(f"Waiting for endpoint to be ready, this can take a few min... {endpoint}")
+      time.sleep(10)
+    else:
+      raise Exception(f'''Error with the endpoint {vs_endpoint_name}. - this shouldn't happen: {endpoint}.\n Please delete it and re-run the previous cell: vsc.delete_endpoint("{vs_endpoint_name}")''')
+  raise Exception(f"Timeout, your endpoint isn't ready yet: {vsc.get_endpoint(vs_endpoint_name)}")
+
+# COMMAND ----------
+
 def index_exists(vsc, endpoint_name, index_full_name):
   try:
     vsc.get_index(endpoint_name, index_full_name).describe()
